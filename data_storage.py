@@ -203,6 +203,8 @@ class DataStorage:
                 '''CREATE TABLE IF NOT EXISTS manga_tags (manga_id TEXT, tag_id TEXT, FOREIGN KEY (manga_id) REFERENCES manga(manga_id), FOREIGN KEY (tag_id) REFERENCES tags(tag_id), PRIMARY KEY (manga_id, tag_id))''')
             self._execute_query(
                 '''CREATE TABLE IF NOT EXISTS uuids (entity_type TEXT, entity_id TEXT, uuid_value TEXT, PRIMARY KEY (entity_type, entity_id))''')
+            self._execute_query(
+                '''CREATE TABLE IF NOT EXISTS files (app_uid TEXT, manga_id TEXT, file_path TEXT, PRIMARY KEY (app_uid, manga_id), FOREIGN KEY (manga_id) REFERENCES manga(manga_id))''')
         elif self.db_type == 'mysql':
             self._execute_query(
                 '''CREATE TABLE IF NOT EXISTS manga (manga_id VARCHAR(255) PRIMARY KEY, title TEXT, description TEXT, last_chapter TEXT, is_deleted BOOLEAN DEFAULT FALSE)''')
@@ -225,6 +227,8 @@ class DataStorage:
                 '''CREATE TABLE IF NOT EXISTS manga_tags (manga_id VARCHAR(255), tag_id VARCHAR(255), FOREIGN KEY (manga_id) REFERENCES manga(manga_id), FOREIGN KEY (tag_id) REFERENCES tags(tag_id), PRIMARY KEY (manga_id, tag_id))''')
             self._execute_query(
                 '''CREATE TABLE IF NOT EXISTS uuids (entity_type VARCHAR(255), entity_id VARCHAR(255), uuid_value VARCHAR(255), PRIMARY KEY (entity_type, entity_id))''')
+            self._execute_query(
+                '''CREATE TABLE IF NOT EXISTS files (app_uid VARCHAR(255), manga_id VARCHAR(255), file_path TEXT, PRIMARY KEY (app_uid, manga_id), FOREIGN KEY (manga_id) REFERENCES manga(manga_id))''')
         elif self.db_type == 'postgres':
             self._execute_query(
                 '''CREATE TABLE IF NOT EXISTS manga (manga_id VARCHAR(255) PRIMARY KEY, title TEXT, description TEXT, last_chapter TEXT, is_deleted BOOLEAN DEFAULT FALSE)''')
@@ -247,6 +251,8 @@ class DataStorage:
                 '''CREATE TABLE IF NOT EXISTS manga_tags (manga_id VARCHAR(255), tag_id VARCHAR(255), FOREIGN KEY (manga_id) REFERENCES manga(manga_id), FOREIGN KEY (tag_id) REFERENCES tags(tag_id), PRIMARY KEY (manga_id, tag_id))''')
             self._execute_query(
                 '''CREATE TABLE IF NOT EXISTS uuids (entity_type VARCHAR(255), entity_id VARCHAR(255), uuid_value VARCHAR(255), PRIMARY KEY (entity_type, entity_id))''')
+            self._execute_query(
+                '''CREATE TABLE IF NOT EXISTS files (app_uid VARCHAR(255), manga_id VARCHAR(255), file_path TEXT, PRIMARY KEY (app_uid, manga_id), FOREIGN KEY (manga_id) REFERENCES manga(manga_id))''')
 
     def _create_indexes(self):
         """
@@ -258,12 +264,14 @@ class DataStorage:
             self._execute_query("CREATE INDEX IF NOT EXISTS idx_files_manga_id ON files(manga_id)")
             self._execute_query("CREATE INDEX IF NOT EXISTS idx_manga_tags_manga_id ON manga_tags(manga_id)")
             self._execute_query("CREATE INDEX IF NOT EXISTS idx_manga_tags_tag_id ON manga_tags(tag_id)")
+            self._execute_query("CREATE INDEX IF NOT EXISTS idx_files_manga_id ON files(manga_id)")
         elif self.db_type == 'postgres':
             self._execute_query("CREATE INDEX IF NOT EXISTS idx_manga_id ON manga(manga_id)")
             self._execute_query("CREATE INDEX IF NOT EXISTS idx_chapter_manga_id ON chapters(manga_id)")
             self._execute_query("CREATE INDEX IF NOT EXISTS idx_files_manga_id ON files(manga_id)")
             self._execute_query("CREATE INDEX IF NOT EXISTS idx_manga_tags_manga_id ON manga_tags(manga_id)")
             self._execute_query("CREATE INDEX IF NOT EXISTS idx_manga_tags_tag_id ON manga_tags(tag_id)")
+            self._execute_query("CREATE INDEX IF NOT EXISTS idx_files_manga_id ON files(manga_id)")
 
     def apply_migrations(self):
         """
@@ -298,6 +306,21 @@ class DataStorage:
             version (str): The version to set.
         """
         self._execute_query("INSERT OR REPLACE INTO db_version (version) VALUES (?)", (version,))
+
+    def store_file(self, app_uid: str, manga_id: str, file_path: str):
+        """
+        Store information about a downloaded file.
+
+        Args:
+            app_uid (str): The application's unique identifier.
+            manga_id (str): The ID of the manga.
+            file_path (str): The path to the stored file.
+        """
+        self._execute_query(
+            "INSERT OR REPLACE INTO files (app_uid, manga_id, file_path) VALUES (?, ?, ?)",
+            (app_uid, manga_id, file_path)
+        )
+        logger.info(f"Stored file information for manga_id: {manga_id}")
 
     def export_schema(self, output_file: str):
         """
