@@ -37,7 +37,8 @@ class Config:
         if self.PDF_PAGE_SIZE == 'a4':
             self.PDF_PAGE_SIZE = (595.276, 841.89)  # A4 size in points
         else:  # default to letter
-            self.PDF_PAGE_SIZE = (595.276, 841.89)  # letter size in points
+            self.PDF_PAGE_SIZE = (letter[0], letter[1])  # letter size in points
+        self.PDF_CREATION_TIMEOUT = int(os.getenv('PDF_CREATION_TIMEOUT', '60'))  # seconds
 
     def ensure_env_variables(self):
         env_file = ".env"
@@ -47,6 +48,7 @@ class Config:
                 f.write(f"HTTP_TIMEOUT=10\n")
                 f.write(f"MAX_CONCURRENT_DOWNLOADS=2\n")
                 f.write(f"PDF_PAGE_SIZE=letter\n")
+                f.write(f"PDF_CREATION_TIMEOUT=60\n")
             load_dotenv(env_file)
 
         for var, value in [
@@ -54,6 +56,7 @@ class Config:
             ('HTTP_TIMEOUT', '10'),
             ('MAX_CONCURRENT_DOWNLOADS', '2'),
             ('PDF_PAGE_SIZE', 'letter'),
+            ('PDF_CREATION_TIMEOUT', '60'),
             ('ENCRYPTION_KEY', Fernet.generate_key().decode())
         ]:
             if not os.environ.get(var):
@@ -109,11 +112,16 @@ class ImageDownloader:
         self.output_path = output_path
         self.lock = threading.Lock()
         self.progress_callback = progress_callback
+        self._cancel_event = asyncio.Event()
 
     def _update_progress(self, message: str):
         if self.progress_callback:
             with self.lock:
                 self.progress_callback(message)
+
+    def cancel_processing(self):
+        """Set the cancellation event to stop ongoing downloads."""
+        self._cancel_event.set()
 
     async def _check_image_quality_async(self, image_path: str) -> bool:
         """
@@ -133,6 +141,9 @@ class ImageDownloader:
         """
         Download an image asynchronously with retry logic and error handling.
         """
+        if self._cancel_event.is_set():
+            return
+
         async with aiohttp.ClientSession() as session:
             for attempt in range(config.MAX_RETRIES + 1):
                 try:
@@ -148,16 +159,18 @@ class ImageDownloader:
                             logger.warning(f"Image from {url} does not meet quality standards, skipping.")
                             results.append(None)
                         return
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    if attempt == config.MAX_RETRIES:
-                        logger.error(f"Failed to download image from {url} after {config.MAX_RETRIES} attempts: {e}")
-                        results.append(None)
-                    else:
-                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                except aiohttp.ClientError as e:
+                    logger.error(f"Client error downloading {url}: {e}")
+                except asyncio.TimeoutError:
+                    logger.error(f"Timeout occurred while downloading from {url}")
                 except Exception as e:
                     logger.error(f"Unexpected error downloading {url}: {e}")
+
+                if attempt == config.MAX_RETRIES:
+                    logger.error(f"Failed to download image from {url} after {config.MAX_RETRIES} attempts")
                     results.append(None)
-                    return
+                else:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
 
     async def process_batch_async(self, batch_data: List[Dict[str, Any]], progress_bar: bool = True,
                                   max_batch_retries: int = 2):
@@ -170,10 +183,15 @@ class ImageDownloader:
 
         print(f"Processing {len(batch_data)} chapters...")
         self._update_progress(f"Starting batch process for {len(batch_data)} chapters")
+        self._cancel_event.clear()
 
         for retry in range(max_batch_retries + 1):
             pdf_results = await self._process_batch_once_async(batch_data, progress_bar)
             failed_count = sum(1 for result in pdf_results if not result["success"])
+
+            if self._cancel_event.is_set():
+                logger.info("Batch processing cancelled by user.")
+                return []
 
             if failed_count == 0:
                 return pdf_results
@@ -250,12 +268,19 @@ class ImageDownloader:
 
     async def _create_pdf_with_retry_async(self, image_paths: List[str], output_file: str, item: Dict[str, Any], max_retries: int = 2) -> bool:
         """
-        Create PDF asynchronously with retry mechanism if creation fails.
+        Create PDF asynchronously with retry mechanism if creation fails, with a timeout for each attempt.
         """
         for attempt in range(max_retries + 1):
             try:
-                await asyncio.to_thread(self._create_pdf, image_paths, output_file, item)
-                return True
+                task = asyncio.create_task(asyncio.to_thread(self._create_pdf, image_paths, output_file, item))
+                done, pending = await asyncio.wait([task], timeout=config.PDF_CREATION_TIMEOUT)
+                if task in done:
+                    return task.result()
+                else:
+                    task.cancel()
+                    raise TimeoutError("PDF creation timed out")
+            except TimeoutError as e:
+                logger.error(f"PDF creation for {item['chapter_id']} timed out after {config.PDF_CREATION_TIMEOUT} seconds: {e}")
             except Exception as e:
                 if attempt == max_retries:
                     logger.error(f"PDF creation failed after {max_retries} retries for {output_file}: {e}")
@@ -370,6 +395,12 @@ class ImageDownloader:
             logger.error(f"PDF trailer check failed for {pdf_path}")
             return False
 
+async def shutdown_async():
+    """Gracefully shut down all asynchronous tasks."""
+    tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 if __name__ == "__main__":
     import asyncio
@@ -399,5 +430,3 @@ if __name__ == "__main__":
     try:
         asyncio.run(downloader.process_batch_async(batch_data))
         print("Batch processing completed.")
-    except Exception as e:
-        logger.error(f"An error occurred during batch processing: {e}\n{traceback.format_exc()}")
