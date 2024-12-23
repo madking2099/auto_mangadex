@@ -258,8 +258,16 @@ class ImageDownloader:
                         logger.error(f"PDF creation failed for {item['chapter_id']} after retries")
                         pdf_results.append({"pdf_path": None, "success": False})
                 else:
-                    logger.warning(f"No valid images for {item['chapter_id']} of {item['manga_title']}, skipping PDF creation.")
+                    logger.warning(
+                        f"No valid images for {item['chapter_id']} of {item['manga_title']}, skipping PDF creation.")
                     pdf_results.append({"pdf_path": None, "success": False})
+
+                # Cleanup of leftover files in the temporary directory
+                for file in os.listdir(temp_dir):
+                    try:
+                        os.remove(os.path.join(temp_dir, file))
+                    except Exception as e:
+                        logger.error(f"Failed to remove temporary file {file}: {e}")
 
         total_time = asyncio.get_event_loop().time() - start_time
         logger.info(f"Batch processing completed in {total_time:.2f} seconds")
@@ -430,3 +438,8 @@ if __name__ == "__main__":
     try:
         asyncio.run(downloader.process_batch_async(batch_data))
         print("Batch processing completed.")
+    except KeyboardInterrupt:
+        print("\nCaught keyboard interrupt, shutting down...")
+        asyncio.run(shutdown_async())
+    except Exception as e:
+        logger.error(f"An error occurred during batch processing: {e}\n{traceback.format_exc()}")
