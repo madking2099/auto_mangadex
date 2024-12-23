@@ -234,8 +234,11 @@ async def main(test_mode: bool = False):
     api = MangaDexAPI(auth_manager)
     user_config = load_user_config('user_config.json')
     if not user_config:
-        user_config = {'default_format': '.pdf', 'max_concurrent_downloads': 2}
-        save_user_config('user_config.json', user_config)
+        if input("Do you want to save configurations? (y/n): ").lower() == 'y':
+            user_config = {'default_format': '.pdf', 'max_concurrent_downloads': 2}
+            save_user_config('user_config.json', user_config)
+        else:
+            user_config = {'default_format': '.pdf', 'max_concurrent_downloads': 2}  # Use in-memory config
 
     downloader = ImageDownloader(output_path=user_config.get('output_directory', '.'))
     data_storage = DataStorage()
