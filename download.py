@@ -16,10 +16,9 @@ from cryptography.fernet import Fernet
 import threading
 import traceback
 import signal
-from concurrent.futures import ThreadPoolExecutor
-from pypdf import PdfReader, PdfWriter
 import asyncio
 import aiohttp
+from pypdf import PdfReader, PdfWriter
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -38,7 +37,7 @@ class Config:
         if self.PDF_PAGE_SIZE == 'a4':
             self.PDF_PAGE_SIZE = (595.276, 841.89)  # A4 size in points
         else:  # default to letter
-            self.PDF_PAGE_SIZE = (letter[0], letter[1])  # letter size in points
+            self.PDF_PAGE_SIZE = (595.276, 841.89)  # letter size in points
 
     def ensure_env_variables(self):
         env_file = ".env"
@@ -86,6 +85,21 @@ class PDFIntegrityError(Exception):
     pass
 
 
+class AsyncProgress:
+    def __init__(self, total):
+        self.total = total
+        self.current = 0
+        self.lock = asyncio.Lock()
+
+    async def update(self, increment=1):
+        async with self.lock:
+            self.current += increment
+            print(f"\rProgress: {self.current}/{self.total}", end="", flush=True)
+
+    def close(self):
+        print()  # New line to reset the progress indicator
+
+
 class ImageDownloader:
     """
     Handles downloading images from URLs, converting them to PNG, and creating PDFs asynchronously.
@@ -117,7 +131,7 @@ class ImageDownloader:
 
     async def _download_image_async(self, url: str, filename: str, temp_dir: str, results: list):
         """
-        Download an image asynchronously with retry logic.
+        Download an image asynchronously with retry logic and error handling.
         """
         async with aiohttp.ClientSession() as session:
             for attempt in range(config.MAX_RETRIES + 1):
@@ -140,6 +154,10 @@ class ImageDownloader:
                         results.append(None)
                     else:
                         await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                except Exception as e:
+                    logger.error(f"Unexpected error downloading {url}: {e}")
+                    results.append(None)
+                    return
 
     async def process_batch_async(self, batch_data: List[Dict[str, Any]], progress_bar: bool = True,
                                   max_batch_retries: int = 2):
@@ -173,15 +191,20 @@ class ImageDownloader:
         pdf_results = []
 
         for item in batch_data:
-            self._update_progress(f"Processing chapter {item['chapter_id']}")
-            logger.info(f"Processing chapter {item['chapter_id']}")
+            logger.info(f"Starting download for {item['chapter_id']} of {item['manga_title']}")
+            self._update_progress(f"Processing chapter {item['chapter_id']} of {item['manga_title']}")
             async with tempfile.TemporaryDirectory() as temp_dir:
                 if progress_bar:
-                    bar = CustomBar('Processing ' + item['chapter_id'], max=len(item['image_urls']) * 2)
+                    progress = AsyncProgress(len(item['image_urls']) * 2)
 
                 image_paths = []
-                tasks = [self._download_image_async(url, f"image_{i:03d}.jpg", temp_dir, image_paths) for i, url in
-                         enumerate(item['image_urls'])]
+                sem = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
+
+                async def download_one_image(url, filename):
+                    async with sem:
+                        return await self._download_image_async(url, filename, temp_dir, image_paths)
+
+                tasks = [download_one_image(url, f"image_{i:03d}.jpg") for i, url in enumerate(item['image_urls'])]
                 await asyncio.gather(*tasks)
 
                 png_paths = []
@@ -191,7 +214,7 @@ class ImageDownloader:
                         if png_path:
                             png_paths.append(png_path)
                         if progress_bar:
-                            bar.next()
+                            await progress.update()
 
                 if png_paths:
                     pdf_path = os.path.join(temp_dir, f"{item['manga_title']}_Chapter_{item['chapter_number']}.pdf")
@@ -202,11 +225,11 @@ class ImageDownloader:
                                 final_pdf_path = os.path.join(self.output_path, os.path.basename(pdf_path))
                                 shutil.move(pdf_path, final_pdf_path)
                                 pdf_results.append({"pdf_path": final_pdf_path, "success": True})
-                                logger.info(f"Successfully created PDF from {len(png_paths)} images: {final_pdf_path}")
-                                self._update_progress(f"PDF created for {item['chapter_id']}")
+                                logger.info(
+                                    f"Successfully created PDF from {len(png_paths)} images for {item['chapter_id']}: {final_pdf_path}")
                                 if progress_bar:
-                                    bar.next(len(item['image_urls']))  # For the PDF creation step
-                                    bar.finish()
+                                    await progress.update(len(item['image_urls']))  # For the PDF creation step
+                                    progress.close()
                             else:
                                 logger.error(f"PDF integrity check failed for {item['chapter_id']} at {pdf_path}")
                                 pdf_results.append({"pdf_path": None, "success": False})
@@ -217,7 +240,7 @@ class ImageDownloader:
                         logger.error(f"PDF creation failed for {item['chapter_id']} after retries")
                         pdf_results.append({"pdf_path": None, "success": False})
                 else:
-                    logger.warning(f"No valid images for {item['chapter_id']}, skipping PDF creation.")
+                    logger.warning(f"No valid images for {item['chapter_id']} of {item['manga_title']}, skipping PDF creation.")
                     pdf_results.append({"pdf_path": None, "success": False})
 
         total_time = asyncio.get_event_loop().time() - start_time
@@ -225,8 +248,7 @@ class ImageDownloader:
         self._update_progress(f"Batch processing completed in {total_time:.2f} seconds")
         return pdf_results
 
-    async def _create_pdf_with_retry_async(self, image_paths: List[str], output_file: str, item: Dict[str, Any],
-                                           max_retries: int = 2) -> bool:
+    async def _create_pdf_with_retry_async(self, image_paths: List[str], output_file: str, item: Dict[str, Any], max_retries: int = 2) -> bool:
         """
         Create PDF asynchronously with retry mechanism if creation fails.
         """
@@ -238,8 +260,7 @@ class ImageDownloader:
                 if attempt == max_retries:
                     logger.error(f"PDF creation failed after {max_retries} retries for {output_file}: {e}")
                     return False
-                logger.warning(
-                    f"PDF creation attempt {attempt + 1}/{max_retries} failed for {output_file}, retrying: {e}")
+                logger.warning(f"PDF creation attempt {attempt + 1}/{max_retries} failed for {output_file}, retrying: {e}")
                 await asyncio.sleep(2 ** attempt)  # Exponential backoff
         return False
 
@@ -280,13 +301,13 @@ class ImageDownloader:
                         new_height = new_width / aspect
                     c.drawImage(image_path, (width - new_width) / 2, (height - new_height) / 2, new_width, new_height)
                     c.showPage()
-                    logger.info(f"Added image {os.path.basename(image_path)} to PDF")
+                    logger.info(f"Added image {os.path.basename(image_path)} to PDF for {item['chapter_id']}")
             except IOError as e:
-                logger.error(f"Failed to process image {os.path.basename(image_path)}: {e}")
+                logger.error(f"Failed to process image {os.path.basename(image_path)} for {item['chapter_id']}: {e}")
 
         c.save()
         self._add_pdf_metadata(output_file, item)
-        logger.info(f"PDF created: {output_file}")
+        logger.info(f"PDF created: {output_file} for {item['chapter_id']}")
 
     def _add_pdf_metadata(self, pdf_path: str, item: Dict[str, Any]):
         """
@@ -307,7 +328,7 @@ class ImageDownloader:
 
         with open(pdf_path, "wb") as output_stream:
             writer.write(output_stream)
-        logger.info(f"Metadata added to {pdf_path}")
+        logger.info(f"Metadata added to {pdf_path} for {item['chapter_id']}")
 
     def _check_pdf_integrity(self, pdf_path: str) -> bool:
         """
@@ -348,6 +369,7 @@ class ImageDownloader:
                 return True
             logger.error(f"PDF trailer check failed for {pdf_path}")
             return False
+
 
 if __name__ == "__main__":
     import asyncio
