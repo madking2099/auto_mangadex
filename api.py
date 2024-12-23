@@ -8,6 +8,7 @@ import logging
 from ratelimit import limits, sleep_and_retry
 from cachetools import TTLCache
 from cryptography.fernet import Fernet
+from auth import AuthenticationError
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -285,6 +286,31 @@ class MangaDexAPI:
 
         all_manga = self._get_all_results("manga", params)
         return [self._parse_manga_data(manga) for manga in all_manga]
+
+    def get_user_list(self) -> List[Dict]:
+        """
+        Retrieve the user's list from MangaDex API.
+
+        Returns:
+            List[Dict]: A list of dictionaries containing manga information from user's list.
+        """
+        if self.auth_manager.is_token_expired():
+            raise AuthenticationError("Session token has expired. Please re-authenticate.")
+
+        response = self._make_request("user/follows/manga", params={"limit": 100})  # Adjust limit as needed
+        return response.get('data', [])
+
+    def get_manga_chapters(self, manga_id: str) -> List[Dict]:
+        """
+        Get chapters for a specific manga.
+
+        Args:
+            manga_id (str): The ID of the manga.
+
+        Returns:
+            List[Dict]: A list of chapter dictionaries.
+        """
+        return self._get_all_results(f"manga/{manga_id}/feed", params={"limit": 100})
 
     def get_chapter_details(self, chapter_id: str) -> Dict[str, Any]:
         """
