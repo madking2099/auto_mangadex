@@ -1,0 +1,395 @@
+import os
+import requests
+import shutil
+import tempfile
+from typing import List, Dict, Optional, Callable
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import inch
+from io import BytesIO
+from PIL import Image
+import logging
+from progress.bar import Bar
+from requests.exceptions import RequestException
+from time import sleep
+from dotenv import load_dotenv
+from cryptography.fernet import Fernet
+import threading
+import traceback
+import signal
+from concurrent.futures import ThreadPoolExecutor
+from pypdf import PdfReader, PdfWriter
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+# Configuration Class for Modular Configuration
+class Config:
+    def __init__(self):
+        load_dotenv(".env")
+        self.MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))
+        self.HTTP_TIMEOUT = int(os.getenv('HTTP_TIMEOUT', '10'))
+        self.ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY')
+        self.MAX_CONCURRENT_DOWNLOADS = int(os.getenv('MAX_CONCURRENT_DOWNLOADS', '2'))
+        self.PDF_PAGE_SIZE = os.getenv('PDF_PAGE_SIZE', 'letter').lower()
+        if self.PDF_PAGE_SIZE == 'a4':
+            self.PDF_PAGE_SIZE = (595.276, 841.89)  # A4 size in points
+        else:  # default to letter
+            self.PDF_PAGE_SIZE = (letter[0], letter[1])  # letter size in points
+
+    def ensure_env_variables(self):
+        env_file = ".env"
+        if not os.path.exists(env_file):
+            with open(env_file, 'w') as f:
+                f.write(f"MAX_RETRIES=3\n")
+                f.write(f"HTTP_TIMEOUT=10\n")
+                f.write(f"MAX_CONCURRENT_DOWNLOADS=2\n")
+                f.write(f"PDF_PAGE_SIZE=letter\n")
+            load_dotenv(env_file)
+
+        for var, value in [
+            ('MAX_RETRIES', '3'),
+            ('HTTP_TIMEOUT', '10'),
+            ('MAX_CONCURRENT_DOWNLOADS', '2'),
+            ('PDF_PAGE_SIZE', 'letter'),
+            ('ENCRYPTION_KEY', Fernet.generate_key().decode())
+        ]:
+            if not os.environ.get(var):
+                with open(env_file, 'a') as f:
+                    f.write(f"{var}={value}\n")
+                load_dotenv(env_file)
+
+
+config = Config()
+config.ensure_env_variables()
+
+
+class CustomBar(Bar):
+    message = '%(percent)d%% %(current)d/%(total)d'
+    fill = '#'
+    suffix = '%(elapsed_td)s'
+
+
+def signal_handler(signum, frame):
+    logger.info("Received interrupt signal. Attempting to stop threads gracefully.")
+    raise SystemExit
+
+
+signal.signal(signal.SIGINT, signal_handler)
+
+
+class PDFIntegrityError(Exception):
+    """Custom exception for PDF integrity issues."""
+    pass
+
+
+class ImageDownloader:
+    """
+    Handles downloading images from URLs, converting them to PNG, and creating PDFs.
+    """
+
+    def __init__(self, output_path: str = ".", progress_callback: Callable[[str], None] = None):
+        self.output_path = output_path
+        self.lock = threading.Lock()
+        self.progress_callback = progress_callback
+
+    def _update_progress(self, message: str):
+        if self.progress_callback:
+            with self.lock:
+                self.progress_callback(message)
+
+    def _check_image_quality(self, image_path: str) -> bool:
+        """
+        Check if the image meets a basic quality standard (not corrupt, has content).
+        """
+        try:
+            with Image.open(image_path) as img:
+                img.verify()
+                if img.size[0] < 10 or img.size[1] < 10:
+                    return False
+                return True
+        except Exception as e:
+            logger.error(f"Image at {image_path} might be corrupt or invalid: {e}")
+            return False
+
+    def _download_image(self, url: str, filename: str, temp_dir: str, results: list):
+        """
+        Download an image with retry logic.
+        """
+        for attempt in range(config.MAX_RETRIES + 1):
+            try:
+                response = requests.get(url, timeout=config.HTTP_TIMEOUT)
+                response.raise_for_status()
+                path = os.path.join(temp_dir, filename)
+                with open(path, 'wb') as f:
+                    f.write(response.content)
+                if self._check_image_quality(path):
+                    with self.lock:
+                        results.append(path)  # Use lock for thread safety
+                else:
+                    logger.warning(f"Image from {url} does not meet quality standards, skipping.")
+                    with self.lock:
+                        results.append(None)  # Use lock for thread safety
+                return
+            except RequestException as e:
+                if attempt == config.MAX_RETRIES:
+                    logger.error(f"Failed to download image from {url} after {config.MAX_RETRIES} attempts: {e}")
+                    with self.lock:
+                        results.append(None)  # Use lock for thread safety
+                else:
+                    sleep(2 ** attempt)  # Exponential backoff
+
+    def process_batch(self, batch_data: List[Dict[str, Any]], progress_bar: bool = True, max_batch_retries: int = 2):
+        """
+        Process a batch of manga chapters with retry mechanism for the whole batch if there are failures.
+        """
+        if not batch_data:
+            logger.info("No items to process in batch.")
+            return []
+
+        print(f"Processing {len(batch_data)} chapters...")
+        self._update_progress(f"Starting batch process for {len(batch_data)} chapters")
+
+        for retry in range(max_batch_retries + 1):
+            pdf_results = self._process_batch_once(batch_data, progress_bar)
+            failed_count = sum(1 for result in pdf_results if not result["success"])
+
+            if failed_count == 0:
+                return pdf_results
+            elif retry < max_batch_retries:
+                logger.warning(
+                    f"Batch processing failed for {failed_count} items. Retrying {retry + 1}/{max_batch_retries}...")
+                self._update_progress(f"Retrying batch process due to {failed_count} failures")
+            else:
+                logger.error(f"Batch processing failed for {failed_count} items after {max_batch_retries} retries.")
+                self._update_progress(f"Batch process failed after {max_batch_retries} retries")
+                return pdf_results
+
+    def _process_batch_once(self, batch_data: List[Dict[str, Any]], progress_bar: bool = True):
+        start_time = time.time()
+        pdf_results = []
+
+        for item in batch_data:
+            self._update_progress(f"Processing chapter {item['chapter_id']}")
+            logger.info(f"Processing chapter {item['chapter_id']}")
+            temp_dir = None
+            try:
+                temp_dir = tempfile.mkdtemp()
+                if progress_bar:
+                    bar = CustomBar('Processing ' + item['chapter_id'], max=len(item['image_urls']) * 2)
+
+                image_paths = []
+                with ThreadPoolExecutor(max_workers=config.MAX_CONCURRENT_DOWNLOADS) as executor:
+                    futures = [executor.submit(self._download_image, url, f"image_{i:03d}.jpg", temp_dir, image_paths) for i, url in enumerate(item['image_urls'])]
+                    for future in futures:
+                        future.result()  # This will raise any exceptions from the download
+                        if progress_bar:
+                            bar.next()
+
+                png_paths = []
+                for path in image_paths:
+                    if path:
+                        png_path = self._convert_to_png(path)
+                        if png_path:
+                            png_paths.append(png_path)
+
+                if png_paths:
+                    pdf_path = os.path.join(temp_dir, f"{item['manga_title']}_Chapter_{item['chapter_number']}.pdf")
+                    if self._create_pdf_with_retry(png_paths, pdf_path, item):
+                        try:
+                            if self._check_pdf_integrity(pdf_path):
+                                final_pdf_path = os.path.join(self.output_path, os.path.basename(pdf_path))
+                                shutil.move(pdf_path, final_pdf_path)
+                                pdf_results.append({"pdf_path": final_pdf_path, "success": True})
+                                logger.info(f"Successfully created PDF from {len(png_paths)} images: {final_pdf_path}")
+                                self._update_progress(f"PDF created for {item['chapter_id']}")
+                                if progress_bar:
+                                    bar.next(len(item['image_urls']))  # For the PDF creation step
+                                    bar.finish()
+                            else:
+                                logger.error(f"PDF integrity check failed for {item['chapter_id']} at {pdf_path}")
+                                pdf_results.append({"pdf_path": None, "success": False})
+                        except PDFIntegrityError as e:
+                            logger.error(f"PDF Integrity Check Error for {item['chapter_id']}: {e}")
+                            pdf_results.append({"pdf_path": None, "success": False})
+                    else:
+                        logger.error(f"PDF creation failed for {item['chapter_id']} after retries")
+                        pdf_results.append({"pdf_path": None, "success": False})
+                else:
+                    logger.warning(f"No valid images for {item['chapter_id']}, skipping PDF creation.")
+                    pdf_results.append({"pdf_path": None, "success": False})
+
+            except OSError as e:
+                logger.error(f"Failed to create temporary directory: {e}")
+                pdf_results.append({"pdf_path": None, "success": False})
+            finally:
+                if temp_dir:
+                    # Cleanup all temporary files including unused images
+                    for file in os.listdir(temp_dir):
+                        try:
+                            os.remove(os.path.join(temp_dir, file))
+                        except Exception as e:
+                            logger.error(f"Failed to remove temporary file {file}: {e}")
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+
+        total_time = time.time() - start_time
+        logger.info(f"Batch processing completed in {total_time:.2f} seconds")
+        self._update_progress(f"Batch processing completed in {total_time:.2f} seconds")
+        return pdf_results
+
+    def _convert_to_png(self, image_path: str) -> Optional[str]:
+        """
+        Convert image to PNG, detecting input format automatically.
+        """
+        try:
+            with Image.open(image_path) as img:
+                current_format = img.format
+                if current_format != 'PNG':
+                    png_path = image_path.rsplit('.', 1)[0] + '.png'
+                    img.save(png_path, 'PNG')
+                    return png_path
+                else:
+                    # If it's already PNG, just return the path
+                    return image_path
+        except Exception as e:
+            logger.error(f"Failed to convert {image_path} to PNG: {e}")
+            return None
+
+    def _create_pdf_with_retry(self, image_paths: List[str], output_file: str, item: Dict[str, Any], max_retries: int = 2) -> bool:
+        """
+        Create PDF with retry mechanism if creation fails.
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                self._create_pdf(image_paths, output_file, item)
+                return True
+            except Exception as e:
+                if attempt == max_retries:
+                    logger.error(f"PDF creation failed after {max_retries} retries for {output_file}: {e}")
+                    return False
+                logger.warning(f"PDF creation attempt {attempt + 1}/{max_retries} failed for {output_file}, retrying: {e}")
+                sleep(2 ** attempt)  # Exponential backoff
+        return False
+
+    def _create_pdf(self, image_paths: List[str], output_file: str, item: Dict[str, Any]):
+        """
+        Create a PDF from a list of image paths with improved logging and metadata.
+        """
+        c = canvas.Canvas(output_file, pagesize=config.PDF_PAGE_SIZE)
+        width, height = config.PDF_PAGE_SIZE
+
+        for image_path in image_paths:
+            try:
+                with Image.open(image_path) as img:
+                    img_width, img_height = img.size
+                    aspect = img_width / float(img_height)
+                    if aspect > 1:  # landscape
+                        new_height = height
+                        new_width = new_height * aspect
+                    else:
+                        new_width = width
+                        new_height = new_width / aspect
+                    c.drawImage(image_path, (width - new_width) / 2, (height - new_height) / 2, new_width, new_height)
+                    c.showPage()
+                    logger.info(f"Added image {os.path.basename(image_path)} to PDF")
+            except IOError as e:
+                logger.error(f"Failed to process image {os.path.basename(image_path)}: {e}")
+
+        c.save()
+        self._add_pdf_metadata(output_file, item)
+        logger.info(f"PDF created: {output_file}")
+
+    def _add_pdf_metadata(self, pdf_path: str, item: Dict[str, Any]):
+        """
+        Add metadata to PDF file based on manga data from api.py.
+        """
+        reader = PdfReader(pdf_path)
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+
+        writer.add_metadata({
+            '/Title': f"{item.get('manga_title', 'Unknown Manga')} - Chapter {item.get('chapter_number', 'Unknown')}",
+            '/Author': ', '.join(item.get('authors', [])),
+            '/Subject': f"Chapter {item.get('chapter_number', 'Unknown')}",
+            '/Keywords': f"Manga, {item.get('manga_title', '')}, {', '.join(item.get('tags', []))}",
+            '/Creator': 'Your Application Name'
+        })
+
+        with open(pdf_path, "wb") as output_stream:
+            writer.write(output_stream)
+        logger.info(f"Metadata added to {pdf_path}")
+
+    def _check_pdf_integrity(self, pdf_path: str) -> bool:
+        """
+        Perform multiple checks to verify PDF integrity using internal Python methods.
+        """
+        if not self._check_pdf_header(pdf_path):
+            raise PDFIntegrityError("PDF header check failed")
+        if not self._check_pdf_trailer(pdf_path):
+            raise PDFIntegrityError("PDF trailer check failed")
+        try:
+            with open(pdf_path, 'rb') as file:
+                PdfReader(file)
+            return True
+        except Exception as e:
+            raise PDFIntegrityError(f"PDF integrity check failed: {e}")
+
+    def _check_pdf_header(self, pdf_path: str) -> bool:
+        """
+        Check if the PDF starts with the correct header.
+        """
+        with open(pdf_path, 'rb') as file:
+            header = file.read(8)
+        if header.startswith(b'%PDF-'):
+            return True
+        logger.error(f"PDF header check failed for {pdf_path}")
+        return False
+
+    def _check_pdf_trailer(self, pdf_path: str) -> bool:
+        """
+        Check for the presence of a PDF trailer.
+        """
+        with open(pdf_path, 'rb') as file:
+            file.seek(0, os.SEEK_END)
+            size = file.tell()
+            file.seek(max(0, size - 2048))  # Look at the last 2048 bytes
+            content = file.read()
+            if b'%%EOF' in content:
+                return True
+            logger.error(f"PDF trailer check failed for {pdf_path}")
+            return False
+
+if __name__ == "__main__":
+    downloader = ImageDownloader(progress_callback=lambda msg: print(msg))
+
+    # Example batch data from api.py (simulated)
+    batch_data = [
+        {
+            'chapter_id': 'chapter123',
+            'chapter_number': '1',
+            'manga_title': 'Manga Title 1',
+            'authors': ['Author 1', 'Author 2'],
+            'tags': ['Shounen', 'Action'],
+            'image_urls': ["url_to_image1.jpg", "url_to_image2.jpg"]
+        },
+        {
+            'chapter_id': 'chapter456',
+            'chapter_number': '2',
+            'manga_title': 'Manga Title 2',
+            'authors': ['Author 3'],
+            'tags': ['Fantasy', 'Adventure'],
+            'image_urls': ["another_url1.jpg", "another_url2.jpg"]
+        },
+    ]
+
+    try:
+        pdf_paths = downloader.process_batch(batch_data)
+        for result in pdf_paths:
+            if result["success"]:
+                print(f"PDF generated at: {result['pdf_path']}")
+            else:
+                print(f"Failed to generate PDF for chapter")
+    except Exception as e:
+        logger.error(f"An error occurred during batch processing: {e}\n{traceback.format_exc()}")

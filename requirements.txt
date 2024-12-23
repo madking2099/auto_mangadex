@@ -1,0 +1,10 @@
+python-dotenv==0.20.0
+requests==2.32.3
+ratelimit==2.2.1
+mysql-connector-python==8.0.33
+psycopg2-binary==2.9.9
+cachetools==5.3.1
+reportlab==3.6.13
+Pillow==9.4.0
+progress==1.6
+pypdf==3.14.0  # Added for PDF integrity check
