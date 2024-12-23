@@ -1,5 +1,11 @@
 # auto_mangadex
 
+## Primary Contributors:
+madking2099
+Grok2
+
+## Project
+
 This is a series of Python files that interact with each other and the public MangaDex API.
 
 The goal of this set of files and project is to be a docker-ized web-application that can executed via CLI as well.
