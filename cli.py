@@ -238,7 +238,21 @@ async def main(test_mode: bool = False):
             user_config = {'default_format': '.pdf', 'max_concurrent_downloads': 2}
             save_user_config('user_config.json', user_config)
         else:
-            user_config = {'default_format': '.pdf', 'max_concurrent_downloads': 2}  # Use in-memory config
+            # Using a dictionary to hold in-memory configuration
+            in_memory_config = {'default_format': '.pdf', 'max_concurrent_downloads': 2}
+
+            # Allow user to customize in-memory configuration
+            in_memory_config['default_format'] = input("Enter default download format (.pdf/.png): ") or '.pdf'
+
+            # Check if the user wants to set a custom output directory
+            if input("Set custom output directory? (y/n): ").lower() == 'y':
+                new_dir = input("Enter new output directory: ")
+                if os.path.isdir(new_dir):
+                    in_memory_config['output_directory'] = new_dir
+                else:
+                    print("Directory does not exist. Using default directory.")
+
+            user_config = in_memory_config
 
     downloader = ImageDownloader(output_path=user_config.get('output_directory', '.'))
     data_storage = DataStorage()
