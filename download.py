@@ -18,6 +18,8 @@ import traceback
 import signal
 from concurrent.futures import ThreadPoolExecutor
 from pypdf import PdfReader, PdfWriter
+import asyncio
+import aiohttp
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -86,7 +88,7 @@ class PDFIntegrityError(Exception):
 
 class ImageDownloader:
     """
-    Handles downloading images from URLs, converting them to PNG, and creating PDFs.
+    Handles downloading images from URLs, converting them to PNG, and creating PDFs asynchronously.
     """
 
     def __init__(self, output_path: str = ".", progress_callback: Callable[[str], None] = None):
@@ -99,12 +101,12 @@ class ImageDownloader:
             with self.lock:
                 self.progress_callback(message)
 
-    def _check_image_quality(self, image_path: str) -> bool:
+    async def _check_image_quality_async(self, image_path: str) -> bool:
         """
-        Check if the image meets a basic quality standard (not corrupt, has content).
+        Asynchronously check if the image meets a basic quality standard (not corrupt, has content).
         """
         try:
-            with Image.open(image_path) as img:
+            async with await asyncio.to_thread(Image.open, image_path) as img:
                 img.verify()
                 if img.size[0] < 10 or img.size[1] < 10:
                     return False
@@ -113,36 +115,36 @@ class ImageDownloader:
             logger.error(f"Image at {image_path} might be corrupt or invalid: {e}")
             return False
 
-    def _download_image(self, url: str, filename: str, temp_dir: str, results: list):
+    async def _download_image_async(self, url: str, filename: str, temp_dir: str, results: list):
         """
-        Download an image with retry logic.
+        Download an image asynchronously with retry logic.
         """
-        for attempt in range(config.MAX_RETRIES + 1):
-            try:
-                response = requests.get(url, timeout=config.HTTP_TIMEOUT)
-                response.raise_for_status()
-                path = os.path.join(temp_dir, filename)
-                with open(path, 'wb') as f:
-                    f.write(response.content)
-                if self._check_image_quality(path):
-                    with self.lock:
-                        results.append(path)  # Use lock for thread safety
-                else:
-                    logger.warning(f"Image from {url} does not meet quality standards, skipping.")
-                    with self.lock:
-                        results.append(None)  # Use lock for thread safety
-                return
-            except RequestException as e:
-                if attempt == config.MAX_RETRIES:
-                    logger.error(f"Failed to download image from {url} after {config.MAX_RETRIES} attempts: {e}")
-                    with self.lock:
-                        results.append(None)  # Use lock for thread safety
-                else:
-                    sleep(2 ** attempt)  # Exponential backoff
+        async with aiohttp.ClientSession() as session:
+            for attempt in range(config.MAX_RETRIES + 1):
+                try:
+                    async with session.get(url, timeout=config.HTTP_TIMEOUT) as response:
+                        response.raise_for_status()
+                        path = os.path.join(temp_dir, filename)
+                        content = await response.read()
+                        with open(path, 'wb') as f:
+                            f.write(content)
+                        if await self._check_image_quality_async(path):
+                            results.append(path)
+                        else:
+                            logger.warning(f"Image from {url} does not meet quality standards, skipping.")
+                            results.append(None)
+                        return
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    if attempt == config.MAX_RETRIES:
+                        logger.error(f"Failed to download image from {url} after {config.MAX_RETRIES} attempts: {e}")
+                        results.append(None)
+                    else:
+                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
 
-    def process_batch(self, batch_data: List[Dict[str, Any]], progress_bar: bool = True, max_batch_retries: int = 2):
+    async def process_batch_async(self, batch_data: List[Dict[str, Any]], progress_bar: bool = True,
+                                  max_batch_retries: int = 2):
         """
-        Process a batch of manga chapters with retry mechanism for the whole batch if there are failures.
+        Process a batch of manga chapters asynchronously with retry mechanism for the whole batch if there are failures.
         """
         if not batch_data:
             logger.info("No items to process in batch.")
@@ -152,7 +154,7 @@ class ImageDownloader:
         self._update_progress(f"Starting batch process for {len(batch_data)} chapters")
 
         for retry in range(max_batch_retries + 1):
-            pdf_results = self._process_batch_once(batch_data, progress_bar)
+            pdf_results = await self._process_batch_once_async(batch_data, progress_bar)
             failed_count = sum(1 for result in pdf_results if not result["success"])
 
             if failed_count == 0:
@@ -166,39 +168,37 @@ class ImageDownloader:
                 self._update_progress(f"Batch process failed after {max_batch_retries} retries")
                 return pdf_results
 
-    def _process_batch_once(self, batch_data: List[Dict[str, Any]], progress_bar: bool = True):
-        start_time = time.time()
+    async def _process_batch_once_async(self, batch_data: List[Dict[str, Any]], progress_bar: bool = True):
+        start_time = asyncio.get_event_loop().time()
         pdf_results = []
 
         for item in batch_data:
             self._update_progress(f"Processing chapter {item['chapter_id']}")
             logger.info(f"Processing chapter {item['chapter_id']}")
-            temp_dir = None
-            try:
-                temp_dir = tempfile.mkdtemp()
+            async with tempfile.TemporaryDirectory() as temp_dir:
                 if progress_bar:
                     bar = CustomBar('Processing ' + item['chapter_id'], max=len(item['image_urls']) * 2)
 
                 image_paths = []
-                with ThreadPoolExecutor(max_workers=config.MAX_CONCURRENT_DOWNLOADS) as executor:
-                    futures = [executor.submit(self._download_image, url, f"image_{i:03d}.jpg", temp_dir, image_paths) for i, url in enumerate(item['image_urls'])]
-                    for future in futures:
-                        future.result()  # This will raise any exceptions from the download
-                        if progress_bar:
-                            bar.next()
+                tasks = [self._download_image_async(url, f"image_{i:03d}.jpg", temp_dir, image_paths) for i, url in
+                         enumerate(item['image_urls'])]
+                await asyncio.gather(*tasks)
 
                 png_paths = []
                 for path in image_paths:
                     if path:
-                        png_path = self._convert_to_png(path)
+                        png_path = await asyncio.to_thread(self._convert_to_png, path)
                         if png_path:
                             png_paths.append(png_path)
+                        if progress_bar:
+                            bar.next()
 
                 if png_paths:
                     pdf_path = os.path.join(temp_dir, f"{item['manga_title']}_Chapter_{item['chapter_number']}.pdf")
-                    if self._create_pdf_with_retry(png_paths, pdf_path, item):
+                    success = await self._create_pdf_with_retry_async(png_paths, pdf_path, item)
+                    if success:
                         try:
-                            if self._check_pdf_integrity(pdf_path):
+                            if await asyncio.to_thread(self._check_pdf_integrity, pdf_path):
                                 final_pdf_path = os.path.join(self.output_path, os.path.basename(pdf_path))
                                 shutil.move(pdf_path, final_pdf_path)
                                 pdf_results.append({"pdf_path": final_pdf_path, "success": True})
@@ -220,23 +220,28 @@ class ImageDownloader:
                     logger.warning(f"No valid images for {item['chapter_id']}, skipping PDF creation.")
                     pdf_results.append({"pdf_path": None, "success": False})
 
-            except OSError as e:
-                logger.error(f"Failed to create temporary directory: {e}")
-                pdf_results.append({"pdf_path": None, "success": False})
-            finally:
-                if temp_dir:
-                    # Cleanup all temporary files including unused images
-                    for file in os.listdir(temp_dir):
-                        try:
-                            os.remove(os.path.join(temp_dir, file))
-                        except Exception as e:
-                            logger.error(f"Failed to remove temporary file {file}: {e}")
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-
-        total_time = time.time() - start_time
+        total_time = asyncio.get_event_loop().time() - start_time
         logger.info(f"Batch processing completed in {total_time:.2f} seconds")
         self._update_progress(f"Batch processing completed in {total_time:.2f} seconds")
         return pdf_results
+
+    async def _create_pdf_with_retry_async(self, image_paths: List[str], output_file: str, item: Dict[str, Any],
+                                           max_retries: int = 2) -> bool:
+        """
+        Create PDF asynchronously with retry mechanism if creation fails.
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                await asyncio.to_thread(self._create_pdf, image_paths, output_file, item)
+                return True
+            except Exception as e:
+                if attempt == max_retries:
+                    logger.error(f"PDF creation failed after {max_retries} retries for {output_file}: {e}")
+                    return False
+                logger.warning(
+                    f"PDF creation attempt {attempt + 1}/{max_retries} failed for {output_file}, retrying: {e}")
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+        return False
 
     def _convert_to_png(self, image_path: str) -> Optional[str]:
         """
@@ -250,27 +255,10 @@ class ImageDownloader:
                     img.save(png_path, 'PNG')
                     return png_path
                 else:
-                    # If it's already PNG, just return the path
                     return image_path
         except Exception as e:
             logger.error(f"Failed to convert {image_path} to PNG: {e}")
             return None
-
-    def _create_pdf_with_retry(self, image_paths: List[str], output_file: str, item: Dict[str, Any], max_retries: int = 2) -> bool:
-        """
-        Create PDF with retry mechanism if creation fails.
-        """
-        for attempt in range(max_retries + 1):
-            try:
-                self._create_pdf(image_paths, output_file, item)
-                return True
-            except Exception as e:
-                if attempt == max_retries:
-                    logger.error(f"PDF creation failed after {max_retries} retries for {output_file}: {e}")
-                    return False
-                logger.warning(f"PDF creation attempt {attempt + 1}/{max_retries} failed for {output_file}, retrying: {e}")
-                sleep(2 ** attempt)  # Exponential backoff
-        return False
 
     def _create_pdf(self, image_paths: List[str], output_file: str, item: Dict[str, Any]):
         """
@@ -362,6 +350,8 @@ class ImageDownloader:
             return False
 
 if __name__ == "__main__":
+    import asyncio
+
     downloader = ImageDownloader(progress_callback=lambda msg: print(msg))
 
     # Example batch data from api.py (simulated)
@@ -385,11 +375,7 @@ if __name__ == "__main__":
     ]
 
     try:
-        pdf_paths = downloader.process_batch(batch_data)
-        for result in pdf_paths:
-            if result["success"]:
-                print(f"PDF generated at: {result['pdf_path']}")
-            else:
-                print(f"Failed to generate PDF for chapter")
+        asyncio.run(downloader.process_batch_async(batch_data))
+        print("Batch processing completed.")
     except Exception as e:
         logger.error(f"An error occurred during batch processing: {e}\n{traceback.format_exc()}")
