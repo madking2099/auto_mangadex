@@ -1,16 +1,11 @@
 import os
-import requests
 import shutil
 import tempfile
 from typing import List, Dict, Optional, Callable
 from reportlab.pdfgen import canvas
-from reportlab.lib.units import inch
-from io import BytesIO
 from PIL import Image
 import logging
 from progress.bar import Bar
-from requests.exceptions import RequestException
-from time import sleep
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 import threading
@@ -411,8 +406,6 @@ async def shutdown_async():
     await asyncio.gather(*tasks, return_exceptions=True)
 
 if __name__ == "__main__":
-    import asyncio
-
     downloader = ImageDownloader(progress_callback=lambda msg: print(msg))
 
     # Example batch data from api.py (simulated)

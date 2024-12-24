@@ -11,6 +11,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
 from progress.bar import IncrementalBar
+import aiohttp
 
 from api import MangaDexAPI, MangaDexAPIError
 from auth import AuthManager
@@ -61,16 +62,41 @@ def save_user_config(config_path: str, config_data: dict):
         json.dump(config_data, f)
 
 
+def log_user_action(action: str, details: str):
+    """Log user actions for auditing or debugging."""
+    logger.info(f"User Action: {action} - Details: {details}")
+
+
+async def retry_on_failure(func, *args, max_retries=3, delay=2):
+    """Retry a function with potential network issues."""
+    for attempt in range(max_retries):
+        try:
+            return await func(*args)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if attempt == max_retries - 1:
+                raise
+            logger.warning(f"Attempt {attempt + 1} failed. Retrying in {delay} seconds: {e}")
+            await asyncio.sleep(delay)
+
+
 async def search_manga(auth_manager: AuthManager, api: MangaDexAPI, page: int = 1) -> List[Dict]:
-    """Search for manga based on various criteria with pagination."""
+    """Search for manga based on various criteria with advanced filters."""
     with IncrementalBar('Searching...', max=100) as bar:  # Adjust max based on expected results
         query = input("Enter manga name/title, author, or tag (separate tags with commas): ")
         search_type = input("Search by (name/title/author/tag/word): ").lower()
+        exclude_tags = input("Enter tags to exclude (comma-separated, press enter for none): ").split(',')
+        language = input("Enter language code (e.g., 'en' for English, leave blank for all): ").strip() or None
+
+        log_user_action("Search",
+                        f"Query: {query}, Type: {search_type}, Excluded Tags: {exclude_tags}, Language: {language}")
+
         if search_type == "tag":
             tags = [tag.strip() for tag in query.split(',')]
-            results = api.search_manga(tags=tags, page=page)
+            results = await retry_on_failure(api.search_manga, tags=tags, excluded_tags=exclude_tags, language=language,
+                                             page=page)
         else:
-            results = api.search_manga(**{search_type: query}, page=page)
+            results = await retry_on_failure(api.search_manga, **{search_type: query}, excluded_tags=exclude_tags,
+                                             language=language, page=page)
 
         for _ in range(100):  # Simulated progress, adjust based on actual results
             bar.next()
@@ -86,33 +112,43 @@ async def search_manga(auth_manager: AuthManager, api: MangaDexAPI, page: int = 
 
 async def download_content(api: MangaDexAPI, downloader: ImageDownloader, data_storage: DataStorage, manga: Dict,
                            chapter_id: str, format_choice: str, test_mode: bool = False):
-    """Download manga content in specified format with progress indication."""
+    """Download manga content in specified format with possibility to restart failed downloads."""
     try:
-        chapter_data = api.get_chapter_details(chapter_id)
+        chapter_data = await retry_on_failure(api.get_chapter_details, chapter_id)
         if not chapter_data:
             logger.error(f"Chapter {chapter_id} not found.")
             print(f"Chapter {chapter_id} not found.")
             return
 
-        image_urls = api.get_chapter_images(chapter_id)
+        image_urls = await retry_on_failure(api.get_chapter_images, chapter_id)
+
+        partial_dir = os.path.join(downloader.output_path,
+                                   f"partial_{manga['title']}_Chapter_{chapter_data['chapter']}")
+        os.makedirs(partial_dir, exist_ok=True)
+
+        existing_files = {f for f in os.listdir(partial_dir) if f.startswith('page_') and f.endswith('.png')}
+        start_from = max([int(f.split('_')[1].split('.')[0]) for f in existing_files], default=0)
+
         with IncrementalBar('Downloading...', max=len(image_urls)) as bar:
             if format_choice == '.pdf':
                 batch_data = [{'urls': image_urls, 'pdf_name': f"{manga['title']}_Chapter_{chapter_data['chapter']}"}]
-                results = await downloader.process_batch_async(batch_data)
-                for _ in image_urls:
+                results = await retry_on_failure(downloader.process_batch_async, batch_data)
+                for i in range(start_from, len(image_urls)):
                     bar.next()
                 file_path = results[0]['pdf_path'] if results[0]["success"] else "Failed to create PDF"
             else:  # Assuming '.png' for simplicity
-                file_path = os.path.join(downloader.output_path, f"{manga['title']}_Chapter_{chapter_data['chapter']}")
-                os.makedirs(file_path, exist_ok=True)
-                for i, url in enumerate(image_urls):
-                    path = os.path.join(file_path, f"page_{i + 1}.png")
+                file_path = partial_dir
+                for i, url in enumerate(image_urls[start_from:], start=start_from):
+                    path = os.path.join(partial_dir, f"page_{i + 1}.png")
                     if not os.path.exists(path):
-                        await downloader._download_image_async(url, f"page_{i + 1}.png", os.path.dirname(path), [])
+                        await retry_on_failure(downloader._download_image_async, url, f"page_{i + 1}.png", partial_dir,
+                                               [])
                     bar.next()
                 file_path = file_path if os.path.exists(file_path) else "Failed to download PNGs"
 
             if not test_mode:
+                log_user_action("Download",
+                                f"Manga: {manga['title']}, Chapter: {chapter_data['chapter']}, Format: {format_choice}, Path: {file_path}")
                 print(f"File(s) available at: {file_path}")
                 if format_choice == '.pdf':
                     data_storage.store_file(downloader.output_path, manga['manga_id'], file_path)
@@ -126,31 +162,29 @@ async def download_content(api: MangaDexAPI, downloader: ImageDownloader, data_s
         print(f"An unexpected error occurred: {e}")
 
 
-async def download_multiple_chapters(api: MangaDexAPI, downloader: ImageDownloader, data_storage: DataStorage,
-                                     manga: Dict, chapters: List[Dict], format_choice: str, test_mode: bool = False):
-    """Download multiple chapters at once."""
-    batch_data = []
-    for chapter in chapters:
-        chapter_data = api.get_chapter_details(chapter['chapter_id'])
-        image_urls = api.get_chapter_images(chapter['chapter_id'])
-        batch_data.append({
-            'urls': image_urls,
-            'pdf_name': f"{manga['title']}_Chapter_{chapter_data['chapter']}"
-        })
-
-    with IncrementalBar('Batch Downloading...', max=len(batch_data)) as bar:
-        if format_choice == '.pdf':
-            results = await downloader.process_batch_async(batch_data)
-            for result in results:
-                if result["success"]:
-                    print(f"PDF created at: {result['pdf_path']}")
-                    if not test_mode:
-                        data_storage.store_file(downloader.output_path, manga['manga_id'], result['pdf_path'])
-                else:
-                    print("Failed to create PDF for one or more chapters.")
-                bar.next()
+async def interactive_search(api: MangaDexAPI, auth_manager: AuthManager, downloader: ImageDownloader,
+                             data_storage: DataStorage, config: dict, test_mode: bool = False):
+    """Provide an interactive mode for searching and downloading."""
+    while True:
+        mangas = await search_manga(auth_manager, api)
+        action = input("Do you want to (d)ownload, (s)earch again, or (q)uit to main menu? ").lower()
+        if action == 'd':
+            selection = int(input("Select a manga by number: ")) - 1
+            if 0 <= selection < len(mangas):
+                selected_manga = mangas[selection]
+                chapters = await retry_on_failure(api.get_manga_chapters, selected_manga['manga_id'])
+                for j, chapter in enumerate(chapters, 1):
+                    print(f"{j}. Chapter {chapter['chapter_number']} - {chapter['title']}")
+                chapter_choice = int(input("Select a chapter by number: ")) - 1
+                if 0 <= chapter_choice < len(chapters):
+                    await retry_on_failure(download_content, api, downloader, data_storage, selected_manga,
+                                           chapters[chapter_choice]['chapter_id'], config['default_format'], test_mode)
+        elif action == 's':
+            continue
+        elif action == 'q':
+            break
         else:
-            print("Batch downloading for PNGs not implemented yet.")
+            print("Invalid choice.")
 
 
 def help_menu():
@@ -165,46 +199,6 @@ def help_menu():
     print("  - Press Ctrl+C once to gracefully exit.")
     print("  - Press Ctrl+C twice to force exit.")
     print("For more detailed usage, please refer to README.md")
-
-
-async def interactive_search(api: MangaDexAPI, auth_manager: AuthManager, downloader: ImageDownloader,
-                             data_storage: DataStorage, config: dict, test_mode: bool = False):
-    """Provide an interactive mode for searching and downloading."""
-    while True:
-        mangas = await search_manga(auth_manager, api)
-        action = input("Do you want to (d)ownload, (s)earch again, (b)atch download, or (q)uit to main menu? ").lower()
-        if action == 'd':
-            selection = int(input("Select a manga by number: ")) - 1
-            if 0 <= selection < len(mangas):
-                selected_manga = mangas[selection]
-                chapters = api.get_manga_chapters(selected_manga['manga_id'])
-                for j, chapter in enumerate(chapters, 1):
-                    print(f"{j}. Chapter {chapter['chapter_number']} - {chapter['title']}")
-                chapter_choice = int(input("Select a chapter by number: ")) - 1
-                if 0 <= chapter_choice < len(chapters):
-                    await download_content(api, downloader, data_storage, selected_manga,
-                                           chapters[chapter_choice]['chapter_id'], config['default_format'], test_mode)
-        elif action == 's':
-            continue
-        elif action == 'b':
-            selection = int(input("Select a manga by number: ")) - 1
-            if 0 <= selection < len(mangas):
-                selected_manga = mangas[selection]
-                chapters = api.get_manga_chapters(selected_manga['manga_id'])
-                chapter_selections = input("Enter chapter numbers to download (e.g., 1,2,3 or 1-3): ").split(',')
-                selected_chapters = []
-                for selection in chapter_selections:
-                    if '-' in selection:
-                        start, end = map(int, selection.split('-'))
-                        selected_chapters.extend(chapters[start - 1:end])
-                    else:
-                        selected_chapters.append(chapters[int(selection) - 1])
-                await download_multiple_chapters(api, downloader, data_storage, selected_manga, selected_chapters,
-                                                 config['default_format'], test_mode)
-        elif action == 'q':
-            break
-        else:
-            print("Invalid choice.")
 
 
 async def main(test_mode: bool = False):
@@ -238,13 +232,10 @@ async def main(test_mode: bool = False):
             user_config = {'default_format': '.pdf', 'max_concurrent_downloads': 2}
             save_user_config('user_config.json', user_config)
         else:
-            # Using a dictionary to hold in-memory configuration
             in_memory_config = {'default_format': '.pdf', 'max_concurrent_downloads': 2}
 
-            # Allow user to customize in-memory configuration
             in_memory_config['default_format'] = input("Enter default download format (.pdf/.png): ") or '.pdf'
 
-            # Check if the user wants to set a custom output directory
             if input("Set custom output directory? (y/n): ").lower() == 'y':
                 new_dir = input("Enter new output directory: ")
                 if os.path.isdir(new_dir):
@@ -271,13 +262,13 @@ async def main(test_mode: bool = False):
                     selection = int(input("Select a manga by number: ")) - 1
                     if 0 <= selection < len(mangas):
                         selected_manga = mangas[selection]
-                        chapters = api.get_manga_chapters(selected_manga['manga_id'])
+                        chapters = await retry_on_failure(api.get_manga_chapters, selected_manga['manga_id'])
                         for j, chapter in enumerate(chapters, 1):
                             print(f"{j}. Chapter {chapter['chapter_number']} - {chapter['title']}")
 
                         chapter_choice = int(input("Select a chapter by number: ")) - 1
                         if 0 <= chapter_choice < len(chapters):
-                            await download_content(api, downloader, data_storage, selected_manga,
+                            await retry_on_failure(download_content, api, downloader, data_storage, selected_manga,
                                                    chapters[chapter_choice]['chapter_id'],
                                                    user_config['default_format'], test_mode)
                         else:
@@ -285,7 +276,7 @@ async def main(test_mode: bool = False):
                     else:
                         print("Invalid manga selection.")
             elif choice == '2' or choice.lower() == 'view':
-                user_list = api.get_user_list()
+                user_list = await retry_on_failure(api.get_user_list)
                 for item in user_list:
                     print(f"{item['title']} - {item['manga_id']}")
                 # Here you would implement functionality to download from the user's list or manage it
