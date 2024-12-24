@@ -1,14 +1,13 @@
 import requests
 import os
 import time
+import uuid
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
-from auth import AuthManager
 import logging
 from ratelimit import limits, sleep_and_retry
 from cachetools import TTLCache
-from cryptography.fernet import Fernet
-from auth import AuthenticationError
+import json
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -17,9 +16,13 @@ logger = logging.getLogger(__name__)
 # Check for .env file and handle environment variables
 env_file = ".env"
 if os.path.exists(env_file):
+    logger.info(f"Loading environment variables from {env_file}")
     load_dotenv(env_file)
 else:
+    logger.info(f"{env_file} not found, generating new ENCRYPTION_KEY")
+    key = Fernet.generate_key().decode()  # Decode to string for .env file
     with open(env_file, 'w') as f:
+        f.write(f"ENCRYPTION_KEY={key}\n")
         f.write(f"MANGADEX_BASE_URL=https://api.mangadex.org/\n")
         f.write(f"CACHE_TTL=300\n")  # Default to 5 minutes
         f.write(f"MAX_RETRIES=3\n")
@@ -51,7 +54,7 @@ if not os.environ.get('ENCRYPTION_KEY'):
     key = Fernet.generate_key().decode()  # Decode to string for .env file
     with open(env_file, 'a') as f:
         f.write(f"ENCRYPTION_KEY={key}\n")
-        load_dotenv(env_file)
+    load_dotenv(env_file)
 
 # Reload .env to ensure new additions are in environment
 load_dotenv(env_file)
@@ -96,7 +99,7 @@ class MangaDexAPI:
     - Dynamic configuration via environment variables
     """
 
-    def __init__(self, auth_manager: AuthManager):
+    def __init__(self, auth_manager):
         """
         Initialize with an AuthManager for handling authenticated requests.
 
@@ -238,25 +241,27 @@ class MangaDexAPI:
         self.cache[cache_key] = all_results  # Cache the results
         return all_results
 
-    def search_manga(self,
-                     query: Optional[str] = None,
-                     author: Optional[str] = None,
-                     tags: Optional[List[str]] = None,
-                     excluded_tags: Optional[List[str]] = None,
-                     title: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def search_manga(self,
+                           query: Optional[str] = None,
+                           author: Optional[str] = None,
+                           tags: Optional[List[str]] = None,
+                           excluded_tags: Optional[List[str]] = None,
+                           language: Optional[str] = None,
+                           page: int = 1) -> List[Dict[str, Any]]:
         """
         Search for manga by various criteria with support for wildcard searches.
 
         Examples:
-            api.search_manga(query="one piece")
-            api.search_manga(author="Oda")
+            await api.search_manga(query="one piece")
+            await api.search_manga(author="Oda")
 
         Args:
             query (str): General keyword search, supports wildcards.
             author (str): Search by author name, supports wildcards.
             tags (List[str]): List of tag IDs to include.
             excluded_tags (List[str]): List of tag IDs to exclude.
-            title (str): Search by manga title, supports wildcards.
+            language (str): Language code for filtering results.
+            page (int): The page number for pagination.
 
         Returns:
             List[Dict[str, Any]]: List of manga matching the search criteria, with extracted IDs and summaries.
@@ -269,55 +274,31 @@ class MangaDexAPI:
             raise ValueError("All tags must be strings")
         if excluded_tags and not all(isinstance(tag, str) for tag in excluded_tags):
             raise ValueError("All excluded tags must be strings")
-        if title and not isinstance(title, str):
-            raise ValueError("Title must be a string")
+        if language and not isinstance(language, str):
+            raise ValueError("Language must be a string")
 
         params = {}
         if query:
             params['title'] = f"%{query}%"  # Wildcard support
         if author:
             params['authors'] = f"%{author}%"  # Wildcard support for author search
-        if title:
-            params['title'] = f"%{title}%"  # Wildcard for title
         if tags:
             params['includedTags[]'] = tags
         if excluded_tags:
             params['excludedTags[]'] = excluded_tags
+        if language:
+            params['availableTranslatedLanguage[]'] = language
+        params['offset'] = (page - 1) * 100  # Assuming 100 items per page
 
         all_manga = self._get_all_results("manga", params)
         return [self._parse_manga_data(manga) for manga in all_manga]
 
-    def get_user_list(self) -> List[Dict]:
-        """
-        Retrieve the user's list from MangaDex API.
-
-        Returns:
-            List[Dict]: A list of dictionaries containing manga information from user's list.
-        """
-        if self.auth_manager.is_token_expired():
-            raise AuthenticationError("Session token has expired. Please re-authenticate.")
-
-        response = self._make_request("user/follows/manga", params={"limit": 100})  # Adjust limit as needed
-        return response.get('data', [])
-
-    def get_manga_chapters(self, manga_id: str) -> List[Dict]:
-        """
-        Get chapters for a specific manga.
-
-        Args:
-            manga_id (str): The ID of the manga.
-
-        Returns:
-            List[Dict]: A list of chapter dictionaries.
-        """
-        return self._get_all_results(f"manga/{manga_id}/feed", params={"limit": 100})
-
-    def get_chapter_details(self, chapter_id: str) -> Dict[str, Any]:
+    async def get_chapter_details(self, chapter_id: str) -> Dict[str, Any]:
         """
         Retrieve chapter details.
 
         Example:
-            chapter_details = api.get_chapter_details("some-chapter-id")
+            chapter_details = await api.get_chapter_details("some-chapter-id")
 
         Args:
             chapter_id (str): The ID of the chapter to fetch details for.
@@ -337,12 +318,12 @@ class MangaDexAPI:
             'hash': chapter_data.get('hash', None)
         }
 
-    def get_chapter_images(self, chapter_id: str) -> List[str]:
+    async def get_chapter_images(self, chapter_id: str) -> List[str]:
         """
         Retrieve the image URLs for a chapter's pages.
 
         Example:
-            image_urls = api.get_chapter_images("some-chapter-id")
+            image_urls = await api.get_chapter_images("some-chapter-id")
 
         Args:
             chapter_id (str): The ID of the chapter whose images are needed.
@@ -370,48 +351,28 @@ class MangaDexAPI:
 
         return image_urls
 
-    def health_check(self) -> bool:
+    async def get_manga_chapters(self, manga_id: str) -> List[Dict[str, Any]]:
         """
-        Check if the MangaDex API is responding.
+        Get chapters for a specific manga.
+
+        Args:
+            manga_id (str): The ID of the manga.
 
         Returns:
-            bool: True if the API is healthy, False otherwise.
+            List[Dict[str, Any]]: A list of chapter dictionaries.
         """
-        try:
-            self._make_request("ping")
-            return True
-        except Exception:
-            return False
+        self._validate_id(manga_id)
+        return self._get_all_results(f"manga/{manga_id}/feed", params={"limit": 100})
 
+    async def get_user_list(self) -> List[Dict[str, Any]]:
+        """
+        Retrieve the user's list from MangaDex API.
 
-if __name__ == "__main__":
-    from auth import AuthManager
+        Returns:
+            List[Dict[str, Any]]: A list of dictionaries containing manga information from user's list.
+        """
+        if self.auth_manager.is_token_expired():
+            raise AuthenticationError("Session token has expired. Please re-authenticate.")
 
-    auth_manager = AuthManager()
-
-    try:
-        # Assuming you have already authenticated
-        api = MangaDexAPI(auth_manager)
-
-        # Example usage
-        results = api.search_manga(query="one piece")
-        if results:
-            manga = results[0]
-            print(f"Manga: {manga['title']}, ID: {manga['manga_id']}")
-
-            # Get cover art
-            cover_url = api.get_manga_cover(manga['manga_id'])
-            print(f"Cover URL: {cover_url if cover_url else 'No cover found'}")
-
-            # Health check
-            if api.health_check():
-                print("MangaDex API is healthy")
-            else:
-                print("MangaDex API is not responding")
-
-    except AuthenticationError as e:
-        logger.error(f"Authentication Error: {e}")
-    except MangaDexAPIError as e:
-        logger.error(f"MangaDex API Error: {e}")
-    except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}")
+        response = self._make_request("user/follows/manga", params={"limit": 100})  # Adjust limit as needed
+        return response.get('data', [])
