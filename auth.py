@@ -47,7 +47,7 @@ env_file = ".env"
 if os.path.exists(env_file):
     logger.info(f"Loading environment variables from {env_file}")
     load_dotenv(env_file)
-    if not os.environ.get('ENCRYPTION_KEY'):
+    if not os.environ.get('ENCRYPTION_KEY', None) or os.environ.get('ENCRYPTION_KEY').strip() == "":
         logger.info(f"{env_file} not found, generating new ENCRYPTION_KEY")
         key = Fernet.generate_key().decode()  # Decode to string for .env file
         with open(env_file, 'a') as f:
