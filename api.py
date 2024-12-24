@@ -1,13 +1,13 @@
 import requests
 import os
 import time
-import uuid
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 import logging
 from ratelimit import limits, sleep_and_retry
 from cachetools import TTLCache
-import json
+from cryptography.fernet import Fernet
+from auth import AuthenticationError
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')

@@ -371,9 +371,9 @@ if __name__ == "__main__":
             else:
                 print("Unknown command. Please try again.")
 
-            except AuthenticationError as e:
-            logger.error(f"Authentication error: {e}")
-            print(f"Authentication error: {e}. Please check your credentials or try again later.")
-        except Exception as e:
+    except AuthenticationError as e:
+        logger.error(f"Authentication error: {e}")
+        print(f"Authentication error: {e}. Please check your credentials or try again later.")
+    except Exception as e:
         logger.error(f"Unexpected error: {e}")
         print(f"An unexpected error occurred: {e}")

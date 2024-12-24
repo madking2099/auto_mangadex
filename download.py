@@ -1,22 +1,15 @@
 import os
-import requests
 import shutil
 import tempfile
-from typing import List, Dict, Optional, Callable
+from typing import List, Dict, Optional, Callable, Any
 from reportlab.pdfgen import canvas
-from reportlab.lib.units import inch
-from io import BytesIO
 from PIL import Image
 import logging
 from progress.bar import Bar
-from requests.exceptions import RequestException
-from time import sleep
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 import threading
-import traceback
 import signal
-from concurrent.futures import ThreadPoolExecutor
 from pypdf import PdfReader, PdfWriter
 import asyncio
 import aiohttp
@@ -38,7 +31,7 @@ class Config:
         if self.PDF_PAGE_SIZE == 'a4':
             self.PDF_PAGE_SIZE = (595.276, 841.89)  # A4 size in points
         else:  # default to letter
-            self.PDF_PAGE_SIZE = (letter[0], letter[1])  # letter size in points
+            self.PDF_PAGE_SIZE = (self.PDF_PAGE_SIZE[0], self.PDF_PAGE_SIZE[1])  # letter size in points
         self.PDF_CREATION_TIMEOUT = int(os.getenv('PDF_CREATION_TIMEOUT', '60'))  # seconds
 
     def ensure_env_variables(self):
@@ -421,7 +414,6 @@ async def shutdown_async():
     await asyncio.gather(*tasks, return_exceptions=True)
 
 if __name__ == "__main__":
-    import asyncio
 
     downloader = ImageDownloader(progress_callback=lambda msg: print(msg))
 
@@ -447,3 +439,5 @@ if __name__ == "__main__":
 
     try:
         asyncio.run(downloader.process_batch_async(batch_data))
+    except Exception as err:
+        raise err
