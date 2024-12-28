@@ -10,35 +10,7 @@ from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
 # Setup logging with configuration
-logging.config.dictConfig({
-    'version': 1,
-    'formatters': {
-        'detailed': {
-            'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        }
-    },
-    'handlers': {
-        'console': {
-            'class': 'logging.StreamHandler',
-            'level': 'DEBUG' if os.environ.get('DEBUG', 'False').lower() == 'true' else 'INFO',
-            'formatter': 'detailed'
-        },
-        'file': {
-            'class': 'logging.FileHandler',
-            'filename': 'auth.log',
-            'level': 'INFO',
-            'formatter': 'detailed'
-        }
-    },
-    'loggers': {
-        __name__: {
-            'level': 'DEBUG',
-            'handlers': ['console', 'file'],
-            'propagate': False,
-        },
-    }
-})
-
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Check for .env file and load or generate ENCRYPTION_KEY

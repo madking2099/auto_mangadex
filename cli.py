@@ -31,8 +31,8 @@ config.ensure_env_variables()
 
 def prompt_for_credentials():
     """Prompt user for MangaDex credentials securely."""
-    uid = input("Enter MangaDex UID: ")
-    password = getpass("Enter MangaDex Password: ")
+    uid = 'madking2099' # input("Enter MangaDex UID: ")
+    password = 'ilkhan2099' # getpass("Enter MangaDex Password: ")
     return uid, password
 
 
@@ -312,12 +312,14 @@ async def main(test_mode: bool = False):
         except ValueError:
             logger.error("Invalid input, please enter a number.")
             print("Invalid input, please enter a number.")
+            break
         except KeyboardInterrupt:
             print("\nCaught keyboard interrupt, attempting graceful exit...")
             break
         except Exception as e:
             logger.error(f"An unexpected error occurred: {e}")
             print(f"An unexpected error occurred. Please try again or check the logs for more details.")
+            break
         finally:
             tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
             for task in tasks:
