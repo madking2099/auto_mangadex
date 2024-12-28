@@ -1,15 +1,18 @@
 import os
 import asyncio
-from getpass import getpass
 from typing import List, Dict
 import argparse
 import signal
 import sys
 import json
-from prompt_toolkit import PromptSession
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.completion import WordCompleter
+import tracemalloc
+# import getpass
+from prompt_toolkit.application import Application
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout.containers import HSplit, Window
+from prompt_toolkit.layout.layout import Layout
+from prompt_toolkit.widgets import TextArea
+from prompt_toolkit.enums import EditingMode
 from progress.bar import IncrementalBar
 import aiohttp
 
@@ -18,7 +21,19 @@ from auth import AuthManager
 from data_storage import DataStorage
 from download import ImageDownloader, Config
 
-import tracemalloc
+
+def signal_handler(signum, frame):
+    print("\nCaught keyboard interrupt, attempting graceful exit...")
+    asyncio.get_event_loop().stop()  # This will stop the event loop
+
+signal.signal(signal.SIGINT, signal_handler)
+
+def handle_sigtstp(signum, frame):
+    print("\nProgram suspended. Use 'fg' to resume or 'Ctrl+C' to exit.")
+    # Since we can't directly suspend from Python, we'll just exit.
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGTSTP, handle_sigtstp)
 
 # Setup logging
 import logging
@@ -34,51 +49,8 @@ config.ensure_env_variables()
 def prompt_for_credentials():
     """Prompt user for MangaDex credentials securely."""
     uid = input("Enter MangaDex UID: ")
-    password = getpass("Enter MangaDex Password: ")
+    password = input("Enter MangaDex Password: ")
     return uid, password
-
-
-def menu():
-    """Display the main menu for CLI interaction."""
-    print("\n--- MangaDex CLI Menu ---")
-    print("1. Search Manga")
-    print("2. View User's List")
-    print("3. Help")
-    print("4. Set Output Directory")
-    print("5. Exit")
-    return input("Choose an option: ")
-
-
-def load_user_config(config_path: str) -> dict:
-    """Load user configuration from JSON file."""
-    try:
-        with open(config_path, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-
-
-def save_user_config(config_path: str, config_data: dict):
-    """Save user configuration to JSON file."""
-    with open(config_path, 'w') as f:
-        json.dump(config_data, f)
-
-
-def log_user_action(action: str, details: str):
-    """Log user actions for auditing or debugging."""
-    logger.info(f"User Action: {action} - Details: {details}")
-
-
-async def retry_on_failure(func, *args, max_retries=3, delay=2):
-    """Retry a function with potential network issues."""
-    for attempt in range(max_retries):
-        try:
-            return await func(*args)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            if attempt == max_retries - 1:
-                raise
-            logger.warning(f"Attempt {attempt + 1} failed. Retrying in {delay} seconds: {e}")
-            await asyncio.sleep(delay)
 
 
 class ProgressBar:
@@ -97,9 +69,18 @@ class ProgressBar:
             self.bar.finish()
         self.bar = None
 
-
 progress_bar = ProgressBar()
 
+async def retry_on_failure(func, *args, max_retries=3, delay=2):
+    """Retry a function with potential network issues."""
+    for attempt in range(max_retries):
+        try:
+            return await func(*args)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if attempt == max_retries - 1:
+                raise
+            logger.warning(f"Attempt {attempt + 1} failed. Retrying in {delay} seconds: {e}")
+            await asyncio.sleep(delay)
 
 async def search_manga(auth_manager: AuthManager, api: MangaDexAPI, page: int = 1) -> List[Dict]:
     """Search for manga based on various criteria with advanced filters."""
@@ -109,16 +90,15 @@ async def search_manga(auth_manager: AuthManager, api: MangaDexAPI, page: int = 
     exclude_tags = input("Enter tags to exclude (comma-separated, press enter for none): ").split(',')
     language = input("Enter language code (e.g., 'en' for English, leave blank for all): ").strip() or None
 
-    log_user_action("Search",
-                    f"Query: {query}, Type: {search_type}, Excluded Tags: {exclude_tags}, Language: {language}")
+    # Log user action
+    logger.info(
+        f"User Action: Search - Query: {query}, Type: {search_type}, Excluded Tags: {exclude_tags}, Language: {language}")
 
     if search_type == "tag":
         tags = [tag.strip() for tag in query.split(',')]
-        results = await retry_on_failure(api.search_manga, tags=tags, excluded_tags=exclude_tags, language=language,
-                                         page=page)
+        results = await retry_on_failure(api.search_manga, tags=tags, excluded_tags=exclude_tags, language=language, page=page)
     else:
-        results = await retry_on_failure(api.search_manga, **{search_type: query}, excluded_tags=exclude_tags,
-                                         language=language, page=page)
+        results = await retry_on_failure(api.search_manga, **{search_type: query}, excluded_tags=exclude_tags, language=language, page=page)
 
     for _ in range(100):  # Simulated progress, adjust based on actual results
         progress_bar.next()
@@ -172,8 +152,8 @@ async def download_content(api: MangaDexAPI, downloader: ImageDownloader, data_s
         progress_bar.finish()
 
         if not test_mode:
-            log_user_action("Download",
-                            f"Manga: {manga['title']}, Chapter: {chapter_data['chapter']}, Format: {format_choice}, Path: {file_path}")
+            logger.info(
+                f"User Action: Download - Manga: {manga['title']}, Chapter: {chapter_data['chapter']}, Format: {format_choice}, Path: {file_path}")
             print(f"File(s) available at: {file_path}")
             if format_choice == '.pdf':
                 data_storage.store_file(downloader.output_path, manga['manga_id'], file_path)
@@ -186,9 +166,7 @@ async def download_content(api: MangaDexAPI, downloader: ImageDownloader, data_s
         logger.error(f"Unexpected error: {e}")
         print(f"An unexpected error occurred: {e}")
 
-
-async def interactive_search(api: MangaDexAPI, auth_manager: AuthManager, downloader: ImageDownloader,
-                             data_storage: DataStorage, config: dict, test_mode: bool = False):
+async def interactive_search(api: MangaDexAPI, auth_manager: AuthManager, downloader: ImageDownloader, data_storage: DataStorage, config: dict, test_mode: bool = False):
     """Provide an interactive mode for searching and downloading."""
     while True:
         mangas = await search_manga(auth_manager, api)
@@ -203,14 +181,14 @@ async def interactive_search(api: MangaDexAPI, auth_manager: AuthManager, downlo
                 chapter_choice = int(input("Select a chapter by number: ")) - 1
                 if 0 <= chapter_choice < len(chapters):
                     await retry_on_failure(download_content, api, downloader, data_storage, selected_manga,
-                                           chapters[chapter_choice]['chapter_id'], config['default_format'], test_mode)
+                                           chapters[chapter_choice]['chapter_id'], config['default_format'],
+                                           test_mode)
         elif action == 's':
             continue
         elif action == 'q':
             break
         else:
             print("Invalid choice.")
-
 
 def help_menu():
     """Display help information about CLI usage."""
@@ -224,6 +202,15 @@ def help_menu():
     print("  - Press Ctrl+C once to gracefully exit.")
     print("  - Press Ctrl+C twice to force exit.")
     print("For more detailed usage, please refer to README.md")
+
+
+kb = KeyBindings()
+
+
+@kb.add('c-q')
+async def exit_(event):
+    """Exit application when Ctrl-Q is pressed."""
+    event.app.exit()
 
 
 async def main(test_mode: bool = False):
@@ -262,14 +249,36 @@ async def main(test_mode: bool = False):
             user_config = default_config  # Use in-memory config
 
     downloader = ImageDownloader(output_path=user_config.get('output_directory', '.'))
+    signal.signal(signal.SIGINT, signal_handler)
 
-    session = PromptSession(history=FileHistory('cli_history.txt'), auto_suggest=AutoSuggestFromHistory(),
-                            completer=WordCompleter(['search', 'view', 'help', 'exit', 'set']))
+    # Create UI components
+    input_area = TextArea(height=1, prompt='Choose an option: ', multiline=False)
+    output_area = TextArea(text="", read_only=True, height=10, style='bg:#000000 #ffffff')
+    title = TextArea(text="--- MangaDex CLI Menu ---", read_only=True, height=1)
+    menu = TextArea(text="1. Search Manga  2. View User's List  3. Help  4. Set Output Directory  5. Exit", read_only=True, height=1)
+
+    root_container = HSplit([
+        title,
+        menu,
+        input_area,
+        output_area,
+    ])
+
+    app = Application(
+        layout=Layout(root_container),
+        key_bindings=kb,
+        full_screen=True,
+        editing_mode=EditingMode.VI,
+    )
 
     while True:
         try:
-            choice = session.prompt('Choose an option: ')
+            await app.run_async()
+            choice = input_area.text.strip()
+            input_area.text = ''
+
             if choice == '1' or choice.lower() == 'search':
+                output_area.text = ""
                 if input("Enter interactive mode? (y/n): ").lower() == 'y':
                     await interactive_search(api, auth_manager, downloader, data_storage, user_config, test_mode)
                 else:
@@ -278,8 +287,9 @@ async def main(test_mode: bool = False):
                     if 0 <= selection < len(mangas):
                         selected_manga = mangas[selection]
                         chapters = await retry_on_failure(api.get_manga_chapters, selected_manga['manga_id'])
-                        for j, chapter in enumerate(chapters, 1):
-                            print(f"{j}. Chapter {chapter['chapter_number']} - {chapter['title']}")
+                        output_area.text = "\n".join(
+                            [f"{j}. Chapter {chapter['chapter_number']} - {chapter['title']}" for j, chapter in
+                             enumerate(chapters, 1)])
 
                         chapter_choice = int(input("Select a chapter by number: ")) - 1
                         if 0 <= chapter_choice < len(chapters):
@@ -291,10 +301,7 @@ async def main(test_mode: bool = False):
                     else:
                         print("Invalid manga selection.")
             elif choice == '2' or choice.lower() == 'view':
-                user_list = await retry_on_failure(api.get_user_list)
-                for item in user_list:
-                    print(f"{item['title']} - {item['manga_id']}")
-                # Here you would implement functionality to download from the user's list or manage it
+                output_area.text = "View User's List functionality not implemented yet."
             elif choice == '3' or choice.lower() == 'help':
                 help_menu()
             elif choice == '4' or choice.lower() == 'set':
@@ -303,32 +310,26 @@ async def main(test_mode: bool = False):
                     downloader = ImageDownloader(output_path=new_dir)
                     user_config['output_directory'] = new_dir
                     data_storage.save_user_config(user_config)
-                    print(f"Output directory set to: {new_dir}")
+                    output_area.text = f"Output directory set to: {new_dir}"
                 else:
-                    print("Directory does not exist. Output directory unchanged.")
+                    output_area.text = "Directory does not exist. Output directory unchanged."
             elif choice == '5' or choice.lower() == 'exit':
                 print("Exiting the program.")
                 break
             else:
-                print("Invalid option, please try again.")
-        except ValueError:
-            logger.error("Invalid input, please enter a number.")
-            print("Invalid input, please enter a number.")
+                output_area.text = "Invalid option, please try again."
+        except asyncio.CancelledError:
+            print("Program cancelled by user.")
             break
         except KeyboardInterrupt:
-            print("\nCaught keyboard interrupt, attempting graceful exit...")
+            print("Keyboard interrupt detected.")
             break
+        except ValueError:
+            logger.error("Invalid input, please enter a number.")
+            output_area.text = "Invalid input, please enter a number."
         except Exception as e:
-            snapshot = tracemalloc.take_snapshot()
-            line_no = snapshot.statistics('lineno')
-            logger.error(f"An unexpected error occurred at {line_no}: {e}")
-            print(f"An unexpected error occurred. Please try again or check the logs for more details.")
-            break
-        finally:
-            tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.error(f"An unexpected error occurred: {e}")
+            output_area.text = f"An unexpected error occurred. Please try again or check the logs for more details."
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ class Config:
         self.HTTP_TIMEOUT = int(os.getenv('HTTP_TIMEOUT', '10'))
         self.ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY')
         self.MAX_CONCURRENT_DOWNLOADS = int(os.getenv('MAX_CONCURRENT_DOWNLOADS', '2'))
+        self.MAX_RESULTS_PER_PAGE = 20
         self.PDF_PAGE_SIZE = os.getenv('PDF_PAGE_SIZE', 'letter').lower()
         if self.PDF_PAGE_SIZE == 'a4':
             self.PDF_PAGE_SIZE = (595.276, 841.89)  # A4 size in points
