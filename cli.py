@@ -18,6 +18,8 @@ from auth import AuthManager
 from data_storage import DataStorage
 from download import ImageDownloader, Config
 
+import tracemalloc
+
 # Setup logging
 import logging
 
@@ -317,7 +319,9 @@ async def main(test_mode: bool = False):
             print("\nCaught keyboard interrupt, attempting graceful exit...")
             break
         except Exception as e:
-            logger.error(f"An unexpected error occurred: {e}")
+            snapshot = tracemalloc.take_snapshot()
+            line_no = snapshot.statistics('lineno')
+            logger.error(f"An unexpected error occurred at {line_no}: {e}")
             print(f"An unexpected error occurred. Please try again or check the logs for more details.")
             break
         finally:
@@ -328,8 +332,11 @@ async def main(test_mode: bool = False):
 
 
 if __name__ == "__main__":
+    tracemalloc.start()
     parser = argparse.ArgumentParser(description="MangaDex CLI with enhanced features.")
     parser.add_argument("--test", action="store_true", help="Run in test mode, no actual downloads.")
     args = parser.parse_args()
 
     asyncio.run(main(test_mode=args.test))
+    tracemalloc.clear_traces()
+    tracemalloc.stop()
