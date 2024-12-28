@@ -24,16 +24,12 @@ from download import ImageDownloader, Config
 
 def signal_handler(signum, frame):
     print("\nCaught keyboard interrupt, attempting graceful exit...")
-    asyncio.get_event_loop().stop()  # This will stop the event loop
+    loop = asyncio.get_event_loop()
+    loop.stop()
+    loop.run_until_complete(loop.shutdown_asyncgens())
 
 signal.signal(signal.SIGINT, signal_handler)
 
-def handle_sigtstp(signum, frame):
-    print("\nProgram suspended. Use 'fg' to resume or 'Ctrl+C' to exit.")
-    # Since we can't directly suspend from Python, we'll just exit.
-    raise KeyboardInterrupt
-
-signal.signal(signal.SIGTSTP, handle_sigtstp)
 
 # Setup logging
 import logging
@@ -212,22 +208,16 @@ async def exit_(event):
     """Exit application when Ctrl-Q is pressed."""
     event.app.exit()
 
+@kb.add('enter')
+def submit_input(event):
+    event.app.layout.current_window.content.text = ''
+    event.app.exit()
+
+@kb.add('tab')
+def move_focus(event):
+    event.app.layout.focus_next()
 
 async def main(test_mode: bool = False):
-    interrupt_count = 0
-
-    def signal_handler(signum, frame):
-        nonlocal interrupt_count
-        interrupt_count += 1
-        if interrupt_count > 1 or not asyncio.get_event_loop().is_running():
-            print("\nForcing exit...")
-            sys.exit(1)
-        else:
-            print("\nPress Ctrl+C again to force exit. Gracefully exiting...")
-            raise KeyboardInterrupt
-
-    signal.signal(signal.SIGINT, signal_handler)
-
     auth_manager = AuthManager()
     uid, password = prompt_for_credentials()
     try:
@@ -276,6 +266,10 @@ async def main(test_mode: bool = False):
             await app.run_async()
             choice = input_area.text.strip()
             input_area.text = ''
+            if choice.lower() == "exit":
+                break
+            elif choice.lower() == "quit":
+                break
 
             if choice == '1' or choice.lower() == 'search':
                 output_area.text = ""
@@ -337,7 +331,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MangaDex CLI with enhanced features.")
     parser.add_argument("--test", action="store_true", help="Run in test mode, no actual downloads.")
     args = parser.parse_args()
-
-    asyncio.run(main(test_mode=args.test))
+    try:
+        asyncio.run(main(test_mode=args.test))
+    except KeyboardInterrupt:
+        print("Exiting due to keyboard interrupt.")
+    finally:
+        loop = asyncio.get_event_loop()
+        loop.close()
     tracemalloc.clear_traces()
     tracemalloc.stop()
