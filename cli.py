@@ -31,8 +31,8 @@ config.ensure_env_variables()
 
 def prompt_for_credentials():
     """Prompt user for MangaDex credentials securely."""
-    uid = 'madking2099' # input("Enter MangaDex UID: ")
-    password = 'ilkhan2099' # getpass("Enter MangaDex Password: ")
+    uid =  input("Enter MangaDex UID: ")
+    password = getpass("Enter MangaDex Password: ")
     return uid, password
 
 
